@@ -5,6 +5,7 @@ This module contains the `Widget` class, the base class for all widgets.
 
 from __future__ import annotations
 
+import weakref
 from asyncio import create_task, gather, wait
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -474,7 +475,7 @@ class Widget(DOMNode):
         self._content_height_cache: tuple[object, int] = (None, 0)
 
         self._arrangement_cache: FIFOCache[
-            tuple[Size, int, bool], DockArrangeResult
+            tuple[object, ...], DockArrangeResult
         ] = FIFOCache(4)
 
         self._styles_cache = StylesCache()
@@ -485,6 +486,21 @@ class Widget(DOMNode):
         """The tooltip content."""
         self.absolute_offset: Offset | None = None
         """Force an absolute offset for the widget (used by tooltips)."""
+
+        # Visual hosting (a.k.a. portal). A widget keeps its *logical* parent
+        # (used for queries, selector matching, event bubbling and unmount
+        # bookkeeping) while it is laid out, composited and hit tested inside a
+        # separate *visual* host.
+        self._visual_host_ref: weakref.ReferenceType[Widget] | None = None
+        """Weak reference to the widget that currently hosts us visually."""
+        self._visual_children: set[Widget] = set()
+        """Widgets hosted visually by us (their logical parent lives elsewhere)."""
+        self._visual_version: int = 0
+        """Bumped whenever a visual hosting relationship touching us changes."""
+        self._visual_arrangement_cache: FIFOCache[
+            tuple[Size, int], DockArrangeResult
+        ] = FIFOCache(4)
+        """Cache for arranging our visually hosted children."""
 
         self._scrollbar_changes: set[tuple[bool, bool]] = set()
         """Used to stabilize scrollbars."""
@@ -1332,6 +1348,20 @@ class Widget(DOMNode):
             return text_content
         return Content.from_markup(text_content)
 
+    def _layout_nodes(self) -> Sequence[Widget]:
+        """Logical children that still occupy our layout flow.
+
+        Children that have been visually hosted elsewhere (portals) are
+        excluded: they keep their logical parent but are laid out inside their
+        visual host instead.
+
+        Returns:
+            A sequence of widgets to arrange.
+        """
+        if any(child._visual_host_ref is not None for child in self._nodes):
+            return [child for child in self._nodes if child._visual_host_ref is None]
+        return self._nodes
+
     def arrange(self, size: Size, optimal: bool = False) -> DockArrangeResult:
         """Arrange child widgets.
 
@@ -1344,20 +1374,45 @@ class Widget(DOMNode):
         Returns:
             Widget locations.
         """
-        cache_key = (size, self._nodes._updates, optimal)
+        cache_key = (size, self._nodes._updates, self._visual_version, optimal)
         cached_result = self._arrangement_cache.get(cache_key)
         if cached_result is not None:
             return cached_result
 
         arrangement = self._arrangement_cache[cache_key] = arrange(
-            self, self._nodes, size, self.screen.size, optimal=optimal
+            self, self._layout_nodes(), size, self.screen.size, optimal=optimal
         )
 
+        return arrangement
+
+    def _arrange_visual(self, size: Size) -> DockArrangeResult:
+        """Arrange the widgets we visually host.
+
+        Visually hosted widgets are arranged relative to our content area,
+        independently of our normal layout flow.
+
+        Args:
+            size: Size of our content (container) area.
+
+        Returns:
+            Widget locations, relative to our container's top-left.
+        """
+        cache_key = (size, self._visual_version)
+        cached_result = self._visual_arrangement_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
+        # Deterministic order, independent of set iteration.
+        visual_children = sorted(self._visual_children, key=lambda w: w.sort_order)
+        arrangement = self._visual_arrangement_cache[cache_key] = arrange(
+            self, visual_children, size, self.screen.size, optimal=False
+        )
         return arrangement
 
     def _clear_arrangement_cache(self) -> None:
         """Clear arrangement cache, forcing a new arrange operation."""
         self._arrangement_cache.clear()
+        self._visual_arrangement_cache.clear()
 
     def _get_virtual_dom(self) -> Iterable[Widget]:
         """Get widgets not part of the DOM.
@@ -1420,6 +1475,156 @@ class Widget(DOMNode):
             return cast("Widget", spot.parent), spot.parent._nodes.index(spot)
         except ValueError:
             raise MountError(f"{spot!r} is not a child of {self!r}") from None
+
+    @property
+    def visual_host(self) -> Widget | None:
+        """The widget currently hosting this one visually, or `None`.
+
+        The visual host is only responsible for layout, composition and mouse
+        hit testing. The logical parent (used by queries, CSS selectors and
+        event bubbling) is unchanged.
+        """
+        host_ref = self._visual_host_ref
+        return None if host_ref is None else host_ref()
+
+    @property
+    def visual_children(self) -> tuple[Widget, ...]:
+        """The widgets visually hosted by this widget.
+
+        These widgets are laid out and composited inside us, but their logical
+        parent (and therefore their query/selector path and event bubbling)
+        lives elsewhere.
+        """
+        return tuple(self._visual_children)
+
+    def attach_visual_host(self, host: Widget) -> Self:
+        """Visually host this widget inside ``host``.
+
+        The widget keeps its existing logical parent, so queries, CSS selector
+        matching and event bubbling continue to follow the logical tree. Only
+        layout, composition and mouse hit testing move to ``host``; the widget
+        is no longer clipped by its logical parent.
+
+        Calling this again with a different host replaces the current visual
+        host. Replacing or removing a visual host never unmounts the widget and
+        never cancels its background tasks.
+
+        Args:
+            host: The widget that should visually host this one.
+
+        Returns:
+            The `Widget` instance.
+
+        Raises:
+            WidgetError: If either widget is not mounted, they belong to
+                different apps, the host is the widget itself, or the host is a
+                logical descendant of the widget (which would create a cycle).
+        """
+        if host is self:
+            raise WidgetError("A widget can't be its own visual host")
+        if not self.is_attached or not host.is_attached:
+            raise WidgetError(
+                "Both a widget and its visual host must be mounted before hosting"
+            )
+        try:
+            if self.app is not host.app:
+                raise WidgetError(
+                    "A widget and its visual host must belong to the same app"
+                )
+        except NoActiveAppError:
+            raise WidgetError(
+                "Both a widget and its visual host must be mounted before hosting"
+            ) from None
+
+        # Reject a visual cycle. Hosting ourselves inside a logical descendant
+        # would lead to infinite recursion while compositing.
+        ancestor: MessagePump | None = host._parent
+        while isinstance(ancestor, Widget):
+            if ancestor is self:
+                raise WidgetError(
+                    "A visual host can't be a logical descendant of the hosted widget"
+                )
+            ancestor = ancestor._parent
+
+        old_host = self.visual_host
+        if old_host is host:
+            return self
+
+        if old_host is not None:
+            old_host._visual_children.discard(self)
+            old_host._visual_version += 1
+            old_host._clear_arrangement_cache()
+
+        host._visual_children.add(self)
+        host._visual_version += 1
+        host._clear_arrangement_cache()
+        self._visual_host_ref = weakref.ref(host)
+        self._visual_version += 1
+
+        logical_parent = self._parent
+        if isinstance(logical_parent, Widget):
+            logical_parent._clear_arrangement_cache()
+        self._clear_arrangement_cache()
+        self.refresh(layout=True)
+        return self
+
+    def detach_visual_host(self) -> Self:
+        """Stop being visually hosted, returning to normal layout flow.
+
+        This only removes the visual hosting relationship. The widget stays in
+        the logical tree (it is not unmounted) and its background tasks are not
+        cancelled.
+
+        Returns:
+            The `Widget` instance.
+        """
+        host = self.visual_host
+        if host is None:
+            return self
+        host._visual_children.discard(self)
+        host._visual_version += 1
+        host._clear_arrangement_cache()
+        self._visual_host_ref = None
+        self._visual_version += 1
+
+        logical_parent = self._parent
+        if isinstance(logical_parent, Widget):
+            logical_parent._clear_arrangement_cache()
+        self._clear_arrangement_cache()
+        self.refresh(layout=True)
+        return self
+
+    def _teardown_visual_hosts(self) -> None:
+        """Remove every visual hosting relationship involving this widget.
+
+        This is used while unmounting and deliberately does *not* post messages
+        or touch message loops / workers, so widgets that remain on the logical
+        tree are never unmounted or cancelled merely because a visual host went
+        away.
+        """
+        # This widget was itself hosted somewhere.
+        if self._visual_host_ref is not None:
+            host = self._visual_host_ref()
+            if host is not None:
+                host._visual_children.discard(self)
+                host._visual_version += 1
+                host._clear_arrangement_cache()
+            self._visual_host_ref = None
+            self._visual_version += 1
+
+        # This widget hosted other (logically separate) widgets. Release them
+        # so they fall back to being laid out by their logical parents.
+        for hosted in tuple(self._visual_children):
+            if hosted.visual_host is self:
+                hosted._visual_host_ref = None
+                hosted._visual_version += 1
+                hosted._clear_arrangement_cache()
+                logical_parent = hosted._parent
+                if isinstance(logical_parent, Widget):
+                    logical_parent._clear_arrangement_cache()
+        self._visual_children.clear()
+        self._visual_version += 1
+        self._visual_arrangement_cache.clear()
 
     def mount(
         self,
@@ -4514,6 +4719,11 @@ class Widget(DOMNode):
     async def _message_loop_exit(self) -> None:
         """Clean up DOM tree."""
         parent = self._parent
+        # Break any visual hosting relationships that involve this widget.
+        # Done before pruning so that widgets visually hosted by us (which are
+        # *not* logical children and must stay alive) are released, and so our
+        # own visual host no longer references us.
+        self._teardown_visual_hosts()
         # Post messages to children, asking them to prune
         children = [*self.children, *self._get_virtual_dom()]
         for node in children:

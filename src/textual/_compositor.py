@@ -740,6 +740,41 @@ class Compositor:
                     dock_gutter,
                 )
 
+            # Inject widgets that are *visually* hosted by this widget. They
+            # keep a different logical parent, so they are absent from our
+            # normal arrangement, but they must still be laid out relative to
+            # our container and composited (and therefore hit tested) here.
+            visual_children = widget._visual_children
+            if visual_children:
+                visual_arrangement = widget._arrange_visual(container_size)
+                # Portals escape clipping (that's the point), so positions are
+                # relative to the container but they paint / hit test over the
+                # whole screen.
+                visual_origin = container_region.offset
+                for visual_placement in reversed(visual_arrangement.placements):
+                    visual_widget = visual_placement.widget
+                    # Honour offset / constrain (and screen-absolute offsets),
+                    # exactly as the normal arrangement path does.
+                    visual_placement = visual_placement.process_offset(
+                        size.region, visual_origin
+                    )
+                    visual_region = (
+                        visual_placement.region
+                        + visual_placement.offset
+                        + visual_origin
+                    )
+                    add_widget(
+                        visual_widget,
+                        visual_placement.region,
+                        visual_region,
+                        ((1, 0, 0),),
+                        layer_order,
+                        no_clip,
+                        visible,
+                        NULL_SPACING,
+                    )
+                    layer_order -= 1
+
         # Add top level (root) widget
         add_widget(
             root,

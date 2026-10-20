@@ -23,6 +23,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Sequence,
     TypeVar,
     Union,
 )
@@ -508,7 +509,7 @@ class Screen(Generic[ScreenResultType], Widget):
             Widget locations.
         """
         # This is customized over the base class to allow for a widget to be maximized
-        cache_key = (size, self._nodes._updates, self.maximized)
+        cache_key = (size, self._nodes._updates, self.maximized, self._visual_version)
         cached_result = self._arrangement_cache.get(cache_key)
         if cached_result is not None:
             return cached_result
@@ -539,13 +540,20 @@ class Screen(Generic[ScreenResultType], Widget):
                 maximize_widgets.insert(0, maximized)
             return maximize_widgets
 
+        arrangement_children: Sequence[Widget]
+        if self.maximized is not None:
+            # Exclude widgets visually hosted elsewhere, even in maximized view.
+            arrangement_children = [
+                widget
+                for widget in get_maximize_widgets(self.maximized)
+                if widget.visual_host is None
+            ]
+        else:
+            arrangement_children = self._layout_nodes()
+
         arrangement = self._arrangement_cache[cache_key] = arrange(
             self,
-            (
-                get_maximize_widgets(self.maximized)
-                if self.maximized is not None
-                else self._nodes
-            ),
+            arrangement_children,
             size,
             self.size,
             False,
